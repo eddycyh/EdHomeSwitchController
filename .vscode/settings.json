@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "array": "cpp",
+        "initializer_list": "cpp",
+        "utility": "cpp",
+        "cstdlib": "cpp",
+        "type_traits": "cpp",
+        "cstring": "cpp",
+        "esp_ota_ops.h": "c"
+    }
+}

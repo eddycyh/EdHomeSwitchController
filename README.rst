@@ -1,4 +1,4 @@
-ESP-IDF template app
+Edlane Smart Home Controller
 ====================
 
 This is a template application to be used with `Espressif IoT Development Framework`_ (ESP-IDF). 

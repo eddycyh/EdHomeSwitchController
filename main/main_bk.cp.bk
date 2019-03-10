@@ -1,0 +1,740 @@
+#include "Arduino.h"
+#include "HardwareSerial.h"
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_system.h"
+#include "esp_spi_flash.h"
+#include "esp_log.h"
+#include "driver/uart.h"
+#include "soc/uart_struct.h"
+#include "string.h"
+#include "SPI.h"
+#include "MFRC522.h"					//MFRC522 Custom Library
+#include "TFT_eSPI.h"					//TFT_eSPI Custom Library
+//#include "FS.h"
+#include "SPIFFS.h"
+#include <JPEGDecoder.h>
+#include "NormScreen.h"
+#include "weather.h"
+#include "nvs_flash.h"
+#include "wifi.h"
+#include "weather_jpeg.h"
+#include "Adafruit_Sensor.h"
+#include "DHT.h"
+#include "DHT_U.h"
+#include "time.h"
+#include "GP2Y1010_DustSensor.h"
+
+//Dust sensor
+const int led_pin = 22;
+const int analog_pin = 34;
+GP2Y1010_DustSensor dustsensor;
+
+//Time NTP Server
+const char* ntp_server = "pool.ntp.org";
+const float hourOffset = 7;
+
+#define minimum(a,b)	(((a) < (b)) ? (a):(b))
+
+//Defination for SPI SD Card 
+#define USE_SPI_MODE
+
+#ifdef USE_SPI_MODE
+#define PIN_NUM_MISO	12
+#define PIN_NUM_MOSI	14
+#define PIN_NUM_CLK	27
+#define PIN_NUM_CS	26
+#endif
+
+#define DHTPIN		5
+#define DHTTYPE		DHT22
+DHT_Unified dht(DHTPIN, DHTTYPE);
+
+static const int RX_BUF_SIZE = 1024;
+const int resetPin = 5;
+const int ssPin = 21;
+MFRC522 mfrc522 = MFRC522(ssPin, resetPin);		//Create an instance
+TFT_eSPI tft = TFT_eSPI();				//Invoke custom library
+byte readCard[4];
+
+#define TFT_GREY 0x5AEB
+
+#define CALIBRATION_FILE	"/TouchCalData2"	//Touch Cal Data
+#define REPEAT_CAL		false			//Repeat cal for each startup
+
+//Keypad start position, key sizes and spacing
+#define KEY_X		40
+#define KEY_Y		96
+#define KEY_W		62
+#define KEY_H		30
+#define KEY_SPACING_X	18
+#define KEY_SPACING_Y	20
+#define KEY_TEXTSIZE	1
+
+//Using two fonts since numbers are nice when bold
+#define LABEL1_FONT &FreeSansOblique12pt7b	//Key label font 1
+#define LABEL2_FONT &FreeSansBold12pt7b
+
+//Numeric display box size and location
+#define DISP_X		1
+#define DISP_Y		10
+#define DISP_W		238
+#define DISP_H		50
+#define DISP_TSIZE	3
+#define DISP_TCOLOR 	TFT_CYAN
+
+//Number length, buffer for storing it and character index
+#define NUM_LEN		12
+char numberBuffer[NUM_LEN + 1] = "";
+uint8_t numberIndex = 0;
+
+//Status line for messages
+#define STATUS_X	120
+#define STATUS_Y	65
+
+//Create 15 Keys for the keypad
+char keyLabel[15][5] = {"New", "Del", "Send", "1", "2", "3", "4", "5", "6", "7", "8", "9", "*", "0", "#"};
+uint16_t keyColor[15] = {	TFT_RED, TFT_DARKGREY, TFT_DARKGREEN,
+				TFT_BLUE, TFT_BLUE, TFT_BLUE,
+				TFT_BLUE, TFT_BLUE, TFT_BLUE,
+				TFT_BLUE, TFT_BLUE, TFT_BLUE,
+				TFT_BLUE, TFT_BLUE, TFT_BLUE
+				};
+
+#define WEATHER_DATA_RETRIEVAL_PERIOD		60000
+unsigned long reference_pressure = 01;
+
+TFT_eSPI_Button key[15];
+
+uint32_t targetTime = 0;
+
+static uint8_t conv2d(const char* p);
+uint8_t hh = 0, mm = 0, ss = 0; //Get H, M, S from compile time
+int dd = 1, MM = 1, yy = 2018;
+unsigned char omm = 99, oss = 99;
+static int xcolon = 0, xsecs = 0;
+unsigned int colour = 0;
+
+float sx = 0, sy = 1, mx = 1, my = 0, hx = -1, hy = 0;				//Saved H, M, S x and y multipliers
+float sdeg = 0, mdeg = 0, hdeg = 0;
+uint16_t osx = 360, osy = 120, omx = 360, omy = 120, ohx = 360, ohy = 120;	//Saved H, M, S x and y coords
+uint16_t x0 = 0, x1 = 0, yy0 = 0, yy1 = 0;
+boolean initial = 1;
+
+uint32_t icount = 0;
+
+void printLocalTime()
+{
+	struct tm timeinfo;
+	if(!getLocalTime(&timeinfo)){
+		Serial.println("Failed to obtain time");
+		return;
+	}
+	Serial.println(&timeinfo, "%A, %B %d %Y %H:%M:%S");
+	hh = (uint8_t)timeinfo.tm_hour;
+	mm = (uint8_t)timeinfo.tm_min;
+	ss = (uint8_t)timeinfo.tm_sec;
+	dd = timeinfo.tm_mday;
+	MM = timeinfo.tm_mon;
+	yy = timeinfo.tm_year;
+}
+
+void renderJPEG(int xpos, int ypos) 
+{
+	//retrieve information about the image
+	uint16_t *pImg;
+	uint16_t mcu_w = JpegDec.MCUWidth;
+	uint16_t mcu_h = JpegDec.MCUHeight;
+	uint16_t max_x = JpegDec.width;
+	uint16_t max_y = JpegDec.height;
+
+	uint32_t min_w = minimum(mcu_w, max_x % mcu_w);
+	uint32_t min_h = minimum(mcu_h, max_y % mcu_h);
+
+	uint32_t win_w = mcu_w;
+	uint32_t win_h = mcu_h;
+	
+	uint32_t drawTime = millis();
+	max_x += xpos;
+	max_y += ypos;
+	Serial.println(JpegDec.width);
+	Serial.println(JpegDec.height);
+	
+	while(JpegDec.read()) {
+		pImg = JpegDec.pImage;
+		int mcu_x = JpegDec.MCUx * mcu_w + xpos;
+		int mcu_y = JpegDec.MCUy * mcu_h + ypos;
+		if(mcu_x + mcu_w <= max_y) win_w = mcu_w;
+		else win_w = min_w;
+		if(mcu_y + mcu_h <= max_y) win_h = mcu_h;
+		else win_h = min_h;
+
+		if(win_w != mcu_w)
+		{
+			uint16_t *cImg;
+			int p = 0;
+			cImg = pImg + win_w;
+			for (int h = 1; h < win_h; h++)
+			{
+				p += mcu_w;
+				for(int w = 0; w < win_w; w++)
+				{
+					*cImg = *(pImg + w + p);
+					cImg++;
+				}
+			}
+		}
+		uint32_t mcu_pixels = win_w * win_h;
+		
+		if((mcu_x + win_w) <= tft.width() && (mcu_y + win_h) <= tft.height())
+		{
+			tft.setWindow(mcu_x, mcu_y, mcu_x + win_w - 1, mcu_y + win_h - 1);
+			while(mcu_pixels--) {
+				tft.pushColor(*pImg++);
+			}
+		}
+		else if ((mcu_y + win_h) >= tft.height()) JpegDec.abort(); //Image has run off bottom of screen so abort
+	}
+	drawTime = millis() - drawTime;
+	Serial.print(F(   "Total render time was    :")); Serial.print(drawTime); Serial.println(F(" ms"));
+	Serial.println(F(""));
+}
+
+void jpegInfo() 
+{
+	Serial.println(F("==============="));
+	Serial.println(F("JPEG image info"));
+	Serial.println(F("==============="));
+	Serial.print(F(  "Width        :")); Serial.println(JpegDec.width);
+	Serial.print(F(  "Height       :")); Serial.println(JpegDec.height);
+	Serial.print(F(  "Components   :")); Serial.println(JpegDec.comps);
+	Serial.print(F(  "MCU / row    :")); Serial.println(JpegDec.MCUSPerRow); 
+	Serial.print(F(  "MCU / col    :")); Serial.println(JpegDec.MCUSPerCol);
+	Serial.print(F(  "Scan type    :")); Serial.println(JpegDec.scanType);
+	Serial.print(F(  "MCU width    :")); Serial.println(JpegDec.MCUWidth);
+	Serial.print(F(  "MCU height   :")); Serial.println(JpegDec.MCUHeight);
+	Serial.println(F("==============="));
+}
+
+void showTime(uint32_t msTime)
+{
+	Serial.print(F(" JPEG drawn in "));
+	Serial.print(msTime);
+	Serial.println(F(" ms "));
+}
+
+void drawArrayJpeg(const uint8_t arrayname[], uint32_t array_size, int xpos, int ypos)
+{
+	int x = xpos;
+	int y = ypos;
+	JpegDec.decodeArray(arrayname, array_size);
+	jpegInfo();		//Print information from the JPEG file 
+	renderJPEG(x,y);
+	Serial.println("##########################################");
+}
+
+void drawKeypad()
+{
+	for (uint8_t row = 0; row < 5; row++) 
+	{
+		for (uint8_t col = 0; col < 3; col++)
+		{
+			uint8_t b = col + row * 3;
+			if (b < 3) tft.setFreeFont(LABEL1_FONT);
+			else tft.setFreeFont(LABEL2_FONT);
+			
+			key[b].initButton(&tft, KEY_X + col * (KEY_W + KEY_SPACING_X), 
+					  KEY_Y + row * (KEY_H + KEY_SPACING_Y), 
+					  KEY_W, KEY_H, TFT_WHITE, keyColor[b], TFT_WHITE, 
+					  keyLabel[b], KEY_TEXTSIZE);
+			key[b].drawButton();
+		}
+	}
+}
+
+void touch_calibrate()
+{
+	uint16_t calData[5];
+	uint8_t calDataOK = 0;
+	
+	//Check file system exists
+	if (!SPIFFS.begin())
+	{
+		Serial.println("Formatting file system");
+		SPIFFS.format();
+		SPIFFS.begin();
+	}
+	if (SPIFFS.exists(CALIBRATION_FILE)) {
+		if (REPEAT_CAL)
+		{
+			SPIFFS.remove(CALIBRATION_FILE);
+		}
+		else
+		{
+			File f = SPIFFS.open(CALIBRATION_FILE, "r");
+			if (f) {
+				if (f.readBytes((char *)calData, 14) == 14)
+					calDataOK = 1;
+				f.close();
+			}
+		}
+	}
+
+	if (calDataOK && !REPEAT_CAL) {
+		// calibration data valid
+		tft.setTouch(calData);
+	} else {
+		// data not valid so recalibrate
+		tft.fillScreen(TFT_BLACK);
+		tft.setCursor(20, 0);
+		tft.setTextFont(2);
+		tft.setTextSize(1);
+		tft.setTextColor(TFT_WHITE, TFT_BLACK);
+		tft.println("Touch corners as indicated");
+		tft.setTextFont(1);
+		tft.println();
+
+		if (REPEAT_CAL) {
+			tft.setTextColor(TFT_RED, TFT_BLACK);
+			tft.println("Set REPEAT_CAL to false to stop this running again!");
+		}
+		tft.calibrateTouch(calData, TFT_MAGENTA, TFT_BLACK, 15);
+		tft.setTextColor(TFT_GREEN, TFT_BLACK);
+		tft.println("Calibration complete!");
+		//store data
+		File f = SPIFFS.open(CALIBRATION_FILE, "w");
+		if (f) {
+			f.write((const unsigned char *)calData, 14);
+			f.close();
+		}
+	}
+}
+
+void status (const char *msg)
+{
+	tft.setTextPadding(240);
+	tft.setTextColor(TFT_WHITE, TFT_DARKGREY);
+	tft.setTextFont(0);
+	tft.setTextDatum(TC_DATUM);
+	tft.setTextSize(1);
+	tft.drawString(msg, STATUS_X, STATUS_Y);
+}
+
+static uint8_t conv2d(const char* p) {
+	uint8_t v = 0;
+	if ('0' <= *p && *p <= 9)
+		v = *p - '0';
+	return 10 * v + *++p - '0';
+}
+
+void drawAnalogClock (void)
+{
+	//tft.fillScreen(TFT_GREY);
+	tft.setTextColor(TFT_WHITE);
+	tft.fillCircle(360, 120, 118, TFT_RED);
+	tft.fillCircle(360, 120, 110, TFT_BLACK);
+
+	for(int i = 0; i < 360; i += 30)
+	{
+		sx = cos((i-90)*0.0174532925);
+		sy = sin((i-90)*0.0174532925);
+		x0 = sx*114+360;
+		yy0 = sy*114+120;
+		x1 = sx*100+360;
+		yy1 = sy*100+120;
+	
+		tft.drawLine(x0, yy0, x1, yy1, TFT_RED);
+	}
+	
+	//Draw 60 Dots
+	for(int i = 0; i < 360; i+= 6) 
+	{
+		sx = cos ((i - 90)*0.0174532925);
+		sy = sin ((i - 90)*0.0174532925);
+		x0 = sx*102+360;
+		yy0 = sy*102+120;
+		//Minute marker
+		tft.drawPixel(x0, yy0, TFT_WHITE);
+
+		//main quadrant dots
+		if(i==0 || i==180) tft.fillCircle(x0, yy0, 2, TFT_WHITE);
+		if(i==90 || i==270) tft.fillCircle(x0, yy0, 2, TFT_WHITE);
+	}
+
+	tft.fillCircle(360, 121, 3, TFT_WHITE);
+	tft.drawCentreString("05-Feb-18", 360, 260, 4);
+	targetTime = millis() + 1000;
+}
+
+void updateAnalogTime (void)
+{
+	if(targetTime < millis()) {
+		targetTime += 1000;
+		ss++;
+		if (ss == 60) {
+			ss = 0;
+			mm++;
+			if(mm>59) {
+				mm = 0;
+				hh++;
+				if(hh>23) {
+					hh = 0;
+				}
+			}
+		}
+		//Compute hand degrees
+		sdeg = ss*6;
+		mdeg = mm*6 + sdeg*0.01666667;
+		hdeg = hh*30 + mdeg*0.08333333;
+		hx = cos((hdeg-90)*0.0174532925);
+		hy = sin((hdeg-90)*0.0174532925);
+		mx = cos((mdeg-90)*0.0174532925);
+		my = sin((mdeg-90)*0.0174532925);
+		sx = cos((sdeg-90)*0.0174532925);
+		sy = sin((sdeg-90)*0.0174532925);
+
+		if(ss ==0 || initial) {
+			initial = 0;
+			//Erase hour and minute hand positions every minute
+			tft.drawLine(ohx, ohy, 360, 121, TFT_BLACK);
+			ohx = hx*62+361;
+			ohy = hy*62+121;
+			tft.drawLine(omx, omy, 360, 121, TFT_BLACK);
+			omx = mx*84+360;
+			omy = my*84+121;
+		}
+		//Redraw new hand positions, hour and minute hands not erased here to avoid flicker
+		tft.drawLine(osx, osy, 360, 121, TFT_BLACK);
+		osx = sx*90+361;
+		osy = sy*90+121;
+		tft.drawLine(osx, osy, 360, 121, TFT_RED);
+		tft.drawLine(ohx, ohy, 360, 121, TFT_WHITE);
+		tft.drawLine(omx, omy, 360, 121, TFT_WHITE);
+		tft.drawLine(osx, osy, 360, 121, TFT_RED);
+		tft.fillCircle(360, 121, 3, TFT_RED);
+	}
+}
+
+void updateDigitalTime (void)
+{
+	if(targetTime < millis()) {
+		tft.setTextSize(1);
+		tft.setTextColor(TFT_BLUE, TFT_ORANGE);
+		//Set next update for 1 second later
+		targetTime = millis() + 1000;
+		ss++;
+		if(ss == 60) {
+			//Check for roll-over
+			ss = 0;
+			omm = mm;
+			mm++;
+			if(mm > 59){
+				mm = 0;
+				hh++;
+				if(hh > 23) {
+					hh = 0;
+				}
+			}
+		}
+		//update digital time
+		int xpos = 250;
+		int ypos = 80;
+		int ysecs = ypos;
+	
+		if(omm != mm) {							//Redraw hours and minutes time every minute
+			omm = mm;
+			if (hh < 10) xpos += tft.drawChar('0', xpos, ypos, 7); 	// Adding leading zero for 24 hr clock
+			xpos += tft.drawNumber(hh, xpos, ypos, 7);		// Draw hours
+			xcolon = xpos;						// Save colon coord for later to flash on/off later
+			xpos += tft.drawChar(':', xpos, ypos, 7);		
+			if (mm < 10) xpos += tft.drawChar('0', xpos, ypos, 7);	// Adding minutes leading zero
+			xpos += tft.drawNumber(mm, xpos, ypos, 7);		// Draw minutes
+			xsecs = xpos;						// Sae seconds 'x' position for later display updates
+		}
+		if(oss != ss) {							//Redraw seconds time every second
+			oss = ss;
+			xpos = xsecs;
+			
+			if(ss % 2) {						// Flash the colons on/off
+				tft.setTextColor(0x39C4, TFT_ORANGE);		// Set color to grey to dim colon
+				tft.drawChar(':', xcolon, ypos, 7);		// Hour:minute colon
+				xpos += tft.drawChar(':', xsecs, ysecs, 7);	// Seconds colon
+				tft.setTextColor(TFT_BLUE, TFT_ORANGE);		// Set color back to BLUE
+			}
+			else {
+				tft.drawChar(':', xcolon, ypos, 7);		// Hour:minute colon
+				xpos += tft.drawChar(':', xsecs, ysecs, 7);	// Seconds colon
+			}
+			//Draw seconds
+			if (ss < 10) xpos += tft.drawChar('0', xpos, ysecs, 7);	// Adding leading zero
+			tft.drawNumber(ss, xpos, ysecs, 7);
+		}
+	}
+	
+}
+
+
+
+static void lcd_touch_task(void *pvParameter)
+{
+	while(1)
+	{
+		//Serial.println("From LCD Touch Task");
+		uint16_t t_x = 0, t_y = 0;
+
+		boolean pressed = tft.getTouch(&t_x, &t_y);
+		for (uint8_t b = 0; b < 15; b++)
+		{
+			if (pressed && key[b].contains(t_x, t_y)) key[b].press(true);
+			else key[b].press(false);
+		}
+		
+		for (uint8_t b = 0; b < 15; b++)
+		{
+			if(b < 3) tft.setFreeFont(LABEL1_FONT);
+			else tft.setFreeFont(LABEL2_FONT);
+
+			if(key[b].justReleased()) key[b].drawButton();				//draw normal
+
+			if(key[b].justPressed()) 
+			{
+				key[b].drawButton(true);						//draw invert
+				if(b >= 3) {
+					if(numberIndex < NUM_LEN) {
+						numberBuffer[numberIndex] = keyLabel[b][0];
+						numberIndex++;
+						numberBuffer[numberIndex] = 0;			//zero terminate
+					}
+					status("");
+				}
+				//Delete Button Pressed
+				if ( b == 1)
+				{
+					numberBuffer[numberIndex] = 0;
+					if(numberIndex > 0)
+					{
+						numberIndex --;
+						numberBuffer[numberIndex] = 0;
+					}
+					status("");
+				}
+				//Sent Button Pressed
+				if (b == 2)
+				{
+					status("Sent value to serial port");
+					Serial.println(numberBuffer);
+				}
+				//New Button Pressed
+				if (b == 0)
+				{
+					status("Value cleared");
+					numberIndex = 0;
+					numberBuffer[numberIndex] = 0;
+				}
+				
+				//Update the number display field 
+				tft.setTextDatum(TL_DATUM);
+				tft.setFreeFont(&FreeSans18pt7b);
+				tft.setTextColor(DISP_TCOLOR);
+				int xwidth = tft.drawString(numberBuffer, DISP_X + 4, DISP_Y + 12);
+				tft.fillRect(DISP_X + 4 + xwidth, DISP_Y + 1, DISP_W - xwidth -5, DISP_H - 2, TFT_BLACK);
+			}			
+		}
+		//updateDigitalTime();		
+		updateAnalogTime();
+		vTaskDelay(100 / portTICK_PERIOD_MS);
+	}
+}
+
+
+static void rfid_task(void *pvParameter)
+{
+	static unsigned char newCardIn = 0;
+	static int cardThres = 0;
+      	while(1) 
+	{
+		vTaskDelay(100 / portTICK_PERIOD_MS);
+	}
+}
+
+void actual_weather_data(void)
+{
+	sensors_event_t event;
+	dht.temperature().getEvent(&event);
+	if(isnan(event.temperature)){
+		Serial.println("Error reading temperature!");
+	}
+	else {
+		Serial.print("Temperature: ");
+		Serial.print(event.temperature);
+		Serial.println(" *C");
+		tft.setTextColor(TFT_WHITE);
+		tft.drawString("Act Temp", 5, 95, 4);
+		tft.drawString(":", 140, 95, 4);
+		tft.setTextColor(TFT_GREEN, TFT_BLUE);
+		tft.drawFloat(event.temperature, 2, 150, 95, 4);
+	}
+
+	dht.humidity().getEvent(&event);
+	if(isnan(event.relative_humidity)) {
+		Serial.println("Error reading humidity");
+	}
+	else {
+		Serial.print("Humidity: ");
+		Serial.print(event.relative_humidity);
+		Serial.println("%");
+		tft.setTextColor(TFT_WHITE);
+		tft.drawString("Act Humi", 5, 125, 4);
+		tft.drawString(":", 140, 125, 4);
+		tft.setTextColor(TFT_GREEN, TFT_BLUE);
+		tft.drawFloat(event.temperature, 2, 150, 125, 4);
+	}
+}
+
+void weather_data_retrieved(uint32_t *args)
+{
+	//tft.setRotation(2);
+	//drawArrayJpeg(weather_Windy1, sizeof(weather_Windy1), 0, 0);
+	//tft.setRotation(1);
+	//drawAnalogClock();
+	weather_data* weather = (weather_data*) args;
+	reference_pressure = (unsigned long) (weather->pressure);
+	
+	tft.setTextColor(TFT_WHITE);
+	tft.drawString("Ref Pres", 5, 5, 4);
+	tft.drawString(":", 140, 5, 4);
+	tft.setTextColor(TFT_GREEN, TFT_BLUE);
+	tft.drawNumber(reference_pressure, 150, 5, 4);
+	tft.setTextColor(TFT_WHITE);
+	tft.drawString("Ref Temp", 5, 35, 4);
+	tft.drawString(":", 140, 35, 4);
+	tft.setTextColor(TFT_GREEN, TFT_BLUE);
+	tft.drawFloat((weather-> temperature) - 273, 2 ,150, 35, 4);
+	tft.setTextColor(TFT_WHITE);
+	tft.drawString("Ref Humi", 5, 65, 4);
+	tft.drawString(":", 140, 65, 4);
+	tft.setTextColor(TFT_GREEN, TFT_BLUE);
+	tft.drawNumber(weather->humidity, 150, 65, 4);
+	ESP_LOGI(TAG, "Reference pressure: %lu Pa", reference_pressure);
+	//actual_weather_data();
+	//float dust = dustsensor.getDustDensity();
+	//Serial.print("Dust Density: "); Serial.print(dust); Serial.println(" ug/m3");
+	//tft.setTextColor(TFT_WHITE);
+	//tft.drawString("Dust(PM2.5)", 5, 155, 4);
+	//tft.drawString(":", 140, 155, 4);
+	//tft.setTextColor(TFT_GREEN, TFT_BLUE);
+	//tft.drawFloat(dust, 2, 150, 155, 4);
+}
+
+
+
+extern "C" void app_main()
+{
+	initArduino();
+	pinMode(4, OUTPUT);
+	digitalWrite(4, HIGH);
+	Serial.begin(115200);
+	Serial.println("Socrates Reader Demostration");
+	//SPI.begin();
+	//mfrc522.PCD_Init();
+	//mfrc522.PCD_DumpVersionToSerial();
+	dht.begin();
+	sensor_t sensor;
+	//Get temperature sensor detail
+	dht.temperature().getSensor(&sensor);
+	Serial.println("______________________________________");
+	Serial.println("Temperature");
+	Serial.print  ("Sensor:     "); Serial.println(sensor.name);
+	Serial.print  ("Driver Ver: "); Serial.println(sensor.version);
+	Serial.print  ("Unique ID:  "); Serial.println(sensor.sensor_id);
+	Serial.print  ("Max Value:  ");	Serial.print(sensor.max_value); Serial.println(" *C");
+	Serial.print  ("Min Value:  "); Serial.print(sensor.min_value); Serial.println(" *C");
+	Serial.print  ("Resolution: "); Serial.print(sensor.resolution); Serial.println(" *C");
+	Serial.println("_______________________________________");
+	//Get humidity sensor detail
+	dht.humidity().getSensor(&sensor);
+	Serial.println("_______________________________________");
+	Serial.println("Humidity");
+	Serial.print  ("Sensor:     "); Serial.println(sensor.name);
+	Serial.print  ("Driver Ver: "); Serial.println(sensor.version);
+	Serial.print  ("Unique ID:  "); Serial.println(sensor.sensor_id);
+	Serial.print  ("Max Value:  "); Serial.print(sensor.max_value); Serial.println("%");
+	Serial.print  ("Min Value:  "); Serial.print(sensor.min_value); Serial.println("%");
+	Serial.print  ("Resolution: "); Serial.print(sensor.resolution); Serial.println("%");
+	Serial.println("________________________________________");
+
+	tft.begin();
+	tft.setRotation(2);
+	tft.fillScreen(random(0xFFFF));
+	//int x = (tft.width()  - 300) / 2 - 1;
+	//int y = (tft.height() - 300) / 2 - 1;
+
+	drawArrayJpeg(weather_Windy1, sizeof(weather_Windy1), 0, 0);
+	delay(2000);	
+
+	/*tft.init();
+	tft.setRotation(1);
+	touch_calibrate();
+	tft.fillScreen(TFT_LIGHTGREY);
+	tft.fillRect(0,0,240,320,TFT_DARKGREY);
+	tft.fillRect(DISP_X, DISP_Y, DISP_W, DISP_H, TFT_BLACK);
+	tft.drawRect(DISP_X, DISP_Y, DISP_W, DISP_H, TFT_WHITE);
+
+	drawKeypad();*/
+	//tft.fillScreen(TFT_ORANGE);
+	tft.setRotation(1);
+	drawAnalogClock();
+	targetTime = millis() + 1000;	
+	tft.fillRect(150, 5, 75, 175, TFT_BLUE);
+	initialise_wifi();	
+	
+	//Get Weather Info from OpenWeatherMap
+	if(reference_pressure == 01) {
+		initialise_weather_data_retrieval(6000);
+		on_weather_data_retrieval(weather_data_retrieved);
+		ESP_LOGW(TAG, "Weather data retrieval initialized");
+	}
+	delay(100);
+	//Update time based on NTP Server
+	configTime(hourOffset * 3600, 3600, ntp_server);
+	delay(100);
+	printLocalTime();
+	delay(100);
+
+	dustsensor.begin(led_pin, analog_pin);
+	dustsensor.setADCbit(12);				//12 bit ADC for ESP32
+	dustsensor.setInputVolts(3.3);
+	delay(1000);
+	float dust = dustsensor.getDustDensity();
+	Serial.print("Dust Density: "); Serial.print(dust); Serial.println(" ug/m3");
+	
+	xTaskCreate(rfid_task, "Hello_World_Task", 2048, NULL, 5, NULL);
+	xTaskCreate(lcd_touch_task, "Display_Task", 2048, NULL, 4, NULL);
+
+	/*Serial.println("Initializing SD Card");
+	sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+	sdspi_slot_config_t slot_config = SDSPI_SLOT_CONFIG_DEFAULT();
+	slot_config.gpio_miso		= PIN_NUM_MISO;
+	slot_config.gpio_mosi		= PIN_NUM_MOSI;
+	slot_config.gpio_sck		= PIN_NUM_CLK;
+	slot_config.gpio_cs		= PIN_NUM_CS;
+	
+	esp_vfs_fat_sdmmc_count_config_t mount_config = {
+		.format_if_mount_failed = false,
+		.max_files = 5
+	};
+
+	sdmmc_card_t* card;
+	esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+	
+	if(ret != ESP_OK) {
+		if(ret == ESP_FAIL) {
+			Serial.println("Failed to mount filesystem, If you wan the card to be formatted, set format_if_mount_failed = true");
+		}
+		else	{
+			Serial.println("Failed to initialize the card");
+		}
+		return;
+	}*/
+}

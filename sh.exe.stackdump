@@ -1,0 +1,9 @@
+Exception: STATUS_ACCESS_VIOLATION at eip=6105E00C
+eax=00880000 ebx=612A3960 ecx=0081C98C edx=001E0008 esi=00000002 edi=612A3940
+ebp=0081CC58 esp=0081C930 program=C:\msys32\usr\bin\sh.exe, pid 14924, thread main
+cs=0023 ds=002B es=002B fs=0053 gs=002B ss=002B
+Stack trace:
+Frame     Function  Args
+0081CC58  6105E00C (00000006, 0081CC7C, 200000D0, 612A3788)
+0081CD18  61007ADF (00000000, 0081CD74, 61006A60, 00000000)
+End of stack trace
